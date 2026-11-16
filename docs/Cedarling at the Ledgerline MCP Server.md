@@ -25,13 +25,13 @@ Out of scope: changes to agentgateway, to the ID-JAG issuance on `sterling-idp` 
 | --- | --- | --- | --- |
 | `ledger-demo.gluu.info` (Janssen 2.6.1) | Gluu (Zico) | Existing server | Redeems the ID-JAG, issues the 5 s JWT access token, and hosts the Janssen Lock server |
 | Janssen Lock server (`jans-lock`, part of 2.6.1) | Gluu | On `ledger-demo` | Serves the signed policy store to Cedarling, registers Cedarling's producer key, verifies and stores TRACE records |
-| Cedarling sidecar (`cedarling-flask-sidecar`, 2.6.1 image) | Gluu | Next to the MCP server | Validates the access token against `ledger-demo`'s keys, decides each tool call, signs a TRACE record |
+| Cedarling sidecar (`cedarling-flask-sidecar`, Cedarling 2.6.10) | Gluu | Next to the MCP server | Validates the access token against `ledger-demo`'s keys, decides each tool call, signs a TRACE record |
 | Ledgerline MCP server | Solo lab (kmcp) or Gluu | Today in Solo's lab | Calls the sidecar before each tool; runs the tool only on ALLOW |
 | agentgateway | Solo | Solo lab | Unchanged: ID-JAG exchange and redemption, forwards the tool call with the access token |
 | Agama Lab Policy Designer | Gluu | cloud.gluu.org | Authors and releases the Ledgerline policy store (Sigstore-signed `.cjar`) |
 | cedarling.dev proof view | Gluu | Public site | Checks a downloaded proof bundle in the browser |
 
-The sidecar image version must match `ledger-demo`: 2.6.1, not the 2.5.21 pin the Agama Lab sandbox uses.
+The sidecar is matched to `ledger-demo` and runs Cedarling 2.6.10. The Agama Lab sandbox pins 2.5.21, so a store must load in both before it is released.
 
 ## Call flow
 
@@ -43,27 +43,29 @@ Steps 1 to 4 are the existing ID-JAG flow; steps 5 and 6 are new.
 2. agentgateway exchanges Bob's ID token for an ID-JAG at Sterling & Vance's IdP.
 3. agentgateway redeems the ID-JAG at `ledger-demo` and gets a 5-second JWT access token.
 4. agentgateway calls the MCP server with that token and a trace id header.
-5. Before running the tool, the MCP server asks the Cedarling sidecar, sending the access token, the tool name as the action and the tool arguments as resource and context. The tool runs only on ALLOW; DENY returns an MCP error.
+5. Before running the tool, the MCP server asks the Cedarling sidecar, sending the access token, the tool name as the action, a Jans::Application resource and the context, with fraud\_indicators set when it detects a prompt injection. The tool runs only on ALLOW; DENY returns an MCP error.
 6. Cedarling signs an `AUTHORIZATION_DECISION` record and sends it to the Janssen Lock server, which verifies and stores it. Lock also delivers the signed policy store to Cedarling.
 
-Headers the MCP server sets on the sidecar call, as the Agama Lab sandbox already does: `Audit-Trace-ID` (the gateway's request id, or `exec-<uuid>` if none arrives), `Audit-Execution-Authority` (`ledgerline`), `Audit-Workload-ID` (the MCP server's name) and `Audit-Workload-Instance-ID`.
+Headers the MCP server sets on every sidecar call; without the first two, the sidecar writes no TRACE record: `Audit-Trace-ID` (the gateway's request id, or `exec-<uuid>` if none arrives), `Audit-Execution-Authority` (`ledgerline`), `Audit-Workload-ID` (the MCP server's name) and `Audit-Workload-Instance-ID`.
 
 ## Policy store
 
-One store, `ledgerline-research-mcp`, in policy-store spec v2 (the format Janssen 2.6.1 reads). Each MCP tool is a Cedar action; the resource is the research item the tool touches. Cedarling runs in token mode (`authorize_multi_issuer`): the identity comes only from the `ledger-demo` access token, so no rule constrains `principal` in its head.
+One store, `ledgerline_research_mcp`, written in Agama Lab and kept in [mzico/ledgerline-policies](https://github.com/mzico/ledgerline-policies) (branch `agama-lab-policy-designer`). v0.1.1 is released and served by `ledger-demo`'s Lock; [PR #1](https://github.com/mzico/ledgerline-policies/pull/1) prepares v0.1.2. Cedarling runs in token mode (`authorize_multi_issuer`): identity comes only from the `ledger-demo` access token, so no rule constrains `principal` in its head.
 
-Trusted issuer: one entry named `Ledgerline` (a Cedar identifier), endpoint `https://ledger-demo.gluu.info/.well-known/openid-configuration`, access token mapped to `Ledgerline::Access_token`. Its claims reach the rules as `context.tokens.ledgerline_access_token`, and the schema must declare that key and `total_token_count`.
+Trusted issuer: named `Jans`, endpoint `https://ledger-demo.gluu.info/.well-known/openid-configuration`, access token mapped to `Jans::Access_token`. Its claims reach the rules as `context.tokens.jans_access_token`. A first release with the issuer named `Ledgerline` (v0.1.0) did not load in Cedarling 2.6.10.
 
 | Rule | Kind | Condition | What it prevents |
 | --- | --- | --- | --- |
-| `read-research` | permit | action `search` or `read_report`, token scope contains `research:read`, token `aud` contains `ledgerline-research` | Calls with a token meant for another service |
-| `block-export` | forbid | action `export` | Bulk research leaving Ledgerline through an agent |
-| `block-suspicious` | forbid | `context.suspicious` is true (set by the MCP server, e.g. a prompt-injection marker in the arguments) | Acting on a hijacked request |
-| `require-verified-email` | forbid | token `email_verified` is not true | Calls for an unverified identity |
+| `read-research` | permit | action `Search` or `Read`, token `scp` contains `research:read`, token `aud` contains `ledgerline-research` | Calls with a token meant for another service |
+| `block-export` | forbid | action `Share` | Research leaving Ledgerline through an agent |
+| `block-suspicious` | forbid | `context.fraud_indicators` contains `prompt_injection` (set by the MCP server) | Acting on a hijacked request |
 
-The tool names (`search`, `read_report`, `export`) are placeholders until the MCP server's real tool list is confirmed.
+Shape of a request:
 
-Token claims the rules read, from the `ledger-demo` doc: `aud`, `scope`, `email`, `user_name`. `scope` must arrive as an array: the planned Update Token script emits a space-separated string, and Cedar cannot split strings. `email_verified` is not in the access token today; add it in the same script or drop that rule.
+- Actions `Search`, `Read` and `Share` are placeholders until Solo sends the real MCP tool names.
+- The resource is a `Jans::Application` with `app_id`, `name` and `url`; the MCP server sends it, e.g. `app_id` = the tool name, `url` = the MCP endpoint.
+- Token claims: `scp` (array) and `aud` (array) are read by the rules; `scope` stays a plain string.
+- The schema's `TokensContext` declares access, ID and userinfo tokens, so the same store also runs on the Agama Lab sandbox, which signs test users in with all three.
 
 ## Evidence
 
@@ -93,6 +95,18 @@ Agama Lab is where Ledgerline's rules are written, signed and rehearsed; it is n
 
 ## Work items
 
+Status on Nov 16, 2026: the main path works on `ledger-demo`. With a real token and the real Flask sidecar, Search is allowed, Share is denied, Read with `prompt_injection` is denied, and Lock stored the signed records with valid signatures.
+
+| # | Item | Status |
+| --- | --- | --- |
+| 1 | Token claims | Done: `scp` array added; `scope` stays a string |
+| 2 | Lock setup | Done: sidecar client, `ledgerline` evidence domain, `FIRST_OBSERVED` chain mode, signing key registered |
+| 3, 4 | Store released and served | Done: v0.1.1, hash matches the release; v0.1.2 in [PR #1](https://github.com/mzico/ledgerline-policies/pull/1) |
+| 5 | Sidecar against Lock | Done with a pasted Lock token |
+| 6 | MCP server pre-tool check | Open: send `Jans::Application`, `fraud_indicators` and both audit headers |
+| 7 | Gateway trace id | Asked Nick; not blocking, the MCP server falls back to `exec-<uuid>` |
+| 8 | Full ID-JAG flow on the rebuilt server | Open |
+
 | # | Work item | Owner | Depends on |
 | --- | --- | --- | --- |
 | 1 | Emit `scope` as an array (and add `email_verified` if the rule stays) in the `ledger-demo` access-token script; confirm with a live token | Zico | none |
@@ -106,6 +120,9 @@ Agama Lab is where Ledgerline's rules are written, signed and rehearsed; it is n
 | 9 | Proof bundle for a non-sandbox Lock: assemble record, producer key and `.cjar` (a small script, or an Agama Lab follow-up) | Gluu | 8 |
 | 10 | Phase 2: agentgateway signs a CAPABILITY\_INVOKED record per forwarded tool call, with its own producer key registered at ledger-demo's Lock, same trace id and execution authority as the decision | Solo, with Gluu on Lock setup | 7, 8 |
 | 11 | Phase 2: show the decision and the invocation side by side for one trace id in Agama Lab's Evidence panel and the cedarling.dev proof view | Gluu | 10 |
+| 12 | Re-run the sidecar test with PR #1, then release v0.1.2 (or only its first commit if aud/scp do not map to attributes on 2.6.10) | Zico | none |
+| 13 | Fix the sandbox test-user login (invalid\_authentication\_method, correlation id 8c2b1319-a74f-49f7-816b-7ffb7f49b9df) so the store can be rehearsed | Gluu | jans-auth log for that id |
+| 14 | Replace the pasted Lock token with one that renews: client credentials from the sidecar's client, or registration if Cedarling 2.6.10 supports it | Gluu | none |
 
 ## Risks and decisions
 
@@ -113,9 +130,16 @@ Agama Lab is where Ledgerline's rules are written, signed and rehearsed; it is n
 | --- | --- | --- |
 | The 5-second access token expires before Cedarling validates it | DENY on a slow call | Validate first thing in the request; keep clocks in sync (NTP), as the interop already requires |
 | Token status-list check adds a fetch to `ledger-demo` per decision | Latency inside the 5-second window | Confirm `ledger-demo` serves `/jans-auth/restv1/status_list`; Cedarling caches it |
-| `scope` stays a string | `read-research` never matches | Work item 1 |
+| `scope` stays a string | `read-research` never matches | Resolved: rules read the scp array |
 | Real MCP tool names and argument shapes unknown | Rules and actions change | Get the tool list from Solo before work item 3 |
 | Sandbox (2.5.21) and `ledger-demo` (2.6.1) differ in store format | A store that passes rehearsal fails on 2.6.1 | Rehearse a final run against `ledger-demo` before the event |
 | agentgateway may not forward a trace id | Gateway log and TRACE record cannot be joined | Fall back to `exec-<uuid>` from the MCP server; ask Solo (work item 7) |
 
 Decided: phase 2 adds gateway-side `CAPABILITY_INVOKED` records. agentgateway, as the enforcement point, signs one record per tool call it forwards, with its own producer key registered at `ledger-demo`'s Lock and the same trace id and execution authority as Cedarling's decision. An auditor then reads both records for one trace id from Lock: what was decided, and what was actually invoked. This depends on Solo adding a TRACE producer to agentgateway (work item 10).
+
+Decided on Nov 16, 2026:
+
+- `require-verified-email` is dropped for phase 1. Email verification is Sterling & Vance's fact, already checked at their IdP before it issues the ID-JAG.
+- `fraud_indicators` replaces `context.suspicious`; no schema change is needed.
+- Placeholder actions `Search`, `Read` and `Share` stay until Solo sends the real tool names.
+- The MCP server, not agentgateway, sets `Audit-Trace-ID` and `Audit-Execution-Authority`. A forwarded gateway request id is used as the trace id when present.
